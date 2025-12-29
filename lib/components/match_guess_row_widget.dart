@@ -18,7 +18,7 @@ class MatchGuessRowWidget extends StatefulWidget {
     this.awayLogoUrl,
   });
 
-  final String? matchId;
+  final String matchId; // <-- make non-null (you already pass id!)
   final String? homeShort;
   final String? awayShort;
   final String? homeLogoUrl;
@@ -31,6 +31,9 @@ class MatchGuessRowWidget extends StatefulWidget {
 class _MatchGuessRowWidgetState extends State<MatchGuessRowWidget> {
   late MatchGuessRowModel _model;
 
+  bool _loaded = false;
+  MatchPredictionsRow? _existingPrediction;
+
   @override
   void setState(VoidCallback callback) {
     super.setState(callback);
@@ -42,22 +45,106 @@ class _MatchGuessRowWidgetState extends State<MatchGuessRowWidget> {
     super.initState();
     _model = createModel(context, () => MatchGuessRowModel());
 
-    _model.homeGuessTextController ??= TextEditingController(text: '0');
+    // Don't hardcode "0" here forever. We'll load real values from Supabase.
+    _model.homeGuessTextController ??= TextEditingController();
     _model.homeGuessFocusNode ??= FocusNode();
 
-    _model.awayGuessTextController ??= TextEditingController(text: '0');
+    _model.awayGuessTextController ??= TextEditingController();
     _model.awayGuessFocusNode ??= FocusNode();
+
+    _loadExistingPrediction();
+  }
+
+  Future<void> _loadExistingPrediction() async {
+    // If not logged in yet, just default to 0.
+    if (currentUserUid.isEmpty) {
+      _model.homeGuessTextController.text = '0';
+      _model.awayGuessTextController.text = '0';
+      safeSetState(() => _loaded = true);
+      return;
+    }
+
+    final rows = await MatchPredictionsTable().queryRows(
+      queryFn: (q) => q
+          .eq('user_id', currentUserUid)
+          .eq('match_id', widget.matchId)
+          .limit(1),
+    );
+
+    _existingPrediction = rows.isNotEmpty ? rows.first : null;
+
+    // Populate the fields from DB (or default to 0)
+    _model.homeGuessTextController.text =
+        (_existingPrediction?.predictedHomeScore ?? 0).toString();
+    _model.awayGuessTextController.text =
+        (_existingPrediction?.predictedAwayScore ?? 0).toString();
+
+    safeSetState(() => _loaded = true);
+  }
+
+  int _parseScore(String s) {
+    // keep it safe: empty/non-numeric => 0
+    return int.tryParse(s.trim()) ?? 0;
+  }
+
+  Future<void> _savePrediction() async {
+    if (currentUserUid.isEmpty) return;
+
+    final home = _parseScore(_model.homeGuessTextController.text);
+    final away = _parseScore(_model.awayGuessTextController.text);
+
+    // If we already have a row -> update
+    if (_existingPrediction != null) {
+      await MatchPredictionsTable().update(
+        data: {
+          'predicted_home_score': home,
+          'predicted_away_score': away,
+        },
+        matchingRows: (rows) => rows
+            .eq('user_id', currentUserUid)
+            .eq('match_id', widget.matchId),
+      );
+      return;
+    }
+
+    // Otherwise insert new row, then keep local cache so we update next time
+    await MatchPredictionsTable().insert({
+      'user_id': currentUserUid,
+      'match_id': widget.matchId,
+      'predicted_home_score': home,
+      'predicted_away_score': away,
+    });
+
+    // Refresh local cache so we don't keep inserting duplicates
+    final rows = await MatchPredictionsTable().queryRows(
+      queryFn: (q) => q
+          .eq('user_id', currentUserUid)
+          .eq('match_id', widget.matchId)
+          .limit(1),
+    );
+    _existingPrediction = rows.isNotEmpty ? rows.first : null;
+  }
+
+  void _debouncedSave(String key) {
+    EasyDebounce.debounce(
+      key,
+      const Duration(milliseconds: 600),
+      () async {
+        await _savePrediction();
+      },
+    );
   }
 
   @override
   void dispose() {
     _model.maybeDispose();
-
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    // While loading, still render — but avoid overwriting controllers.
+    // (_loaded only matters if you want to show a shimmer/spinner. Optional.)
     return Container(
       width: 425.45,
       height: 100.0,
@@ -68,313 +155,139 @@ class _MatchGuessRowWidgetState extends State<MatchGuessRowWidget> {
         mainAxisSize: MainAxisSize.max,
         children: [
           Padding(
-            padding: EdgeInsetsDirectional.fromSTEB(10.0, 0.0, 0.0, 0.0),
+            padding: const EdgeInsetsDirectional.fromSTEB(10.0, 0.0, 0.0, 0.0),
             child: Container(
               width: 40.0,
               height: 40.0,
               clipBehavior: Clip.antiAlias,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-              ),
+              decoration: const BoxDecoration(shape: BoxShape.circle),
               child: Image.network(
-                widget.homeLogoUrl!,
+                widget.homeLogoUrl ?? '',
                 fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
               ),
             ),
           ),
           Padding(
-            padding: EdgeInsetsDirectional.fromSTEB(5.0, 0.0, 0.0, 0.0),
+            padding: const EdgeInsetsDirectional.fromSTEB(5.0, 0.0, 0.0, 0.0),
             child: Text(
-              valueOrDefault<String>(
-                widget.homeShort,
-                'home',
-              ),
+              valueOrDefault<String>(widget.homeShort, 'home'),
               style: FlutterFlowTheme.of(context).bodyMedium.override(
-                    font: GoogleFonts.inter(
-                      fontWeight:
-                          FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                      fontStyle:
-                          FlutterFlowTheme.of(context).bodyMedium.fontStyle,
-                    ),
+                    font: GoogleFonts.inter(),
                     letterSpacing: 0.0,
-                    fontWeight:
-                        FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                    fontStyle:
-                        FlutterFlowTheme.of(context).bodyMedium.fontStyle,
                   ),
             ),
           ),
+
+          // HOME SCORE
           Expanded(
-            child: Container(
+            child: SizedBox(
               width: 200.0,
               child: TextFormField(
                 controller: _model.homeGuessTextController,
                 focusNode: _model.homeGuessFocusNode,
-                onChanged: (_) => EasyDebounce.debounce(
-                  '_model.homeGuessTextController',
-                  Duration(milliseconds: 2000),
-                  () async {
-                    _model.queryResult =
-                        await MatchPredictionsTable().queryRows(
-                      queryFn: (q) => q
-                          .eqOrNull(
-                            'id',
-                            widget.matchId,
-                          )
-                          .eqOrNull(
-                            'user_id',
-                            currentUserUid,
-                          ),
-                    );
-                    if (_model.queryResult != null &&
-                        (_model.queryResult)!.isNotEmpty) {
-                      await MatchPredictionsTable().update(
-                        data: {
-                          'predicted_home_score':
-                              int.tryParse(_model.homeGuessTextController.text),
-                          'predicted_away_score':
-                              int.tryParse(_model.awayGuessTextController.text),
-                        },
-                        matchingRows: (rows) => rows
-                            .eqOrNull(
-                              'user_id',
-                              currentUserUid,
-                            )
-                            .eqOrNull(
-                              'match_id',
-                              widget.matchId,
-                            ),
-                      );
-                    } else {
-                      await MatchPredictionsTable().insert({
-                        'user_id': currentUserUid,
-                        'match_id': widget.matchId,
-                        'predicted_home_score':
-                            int.tryParse(_model.homeGuessTextController.text),
-                        'predicted_away_score':
-                            int.tryParse(_model.awayGuessTextController.text),
-                      });
-                    }
-
-                    safeSetState(() {});
-                  },
-                ),
+                onChanged: (_) => _debouncedSave('home_${widget.matchId}'),
+                onEditingComplete: () async {
+                  await _savePrediction();
+                  FocusScope.of(context).unfocus();
+                },
+                onFieldSubmitted: (_) async {
+                  await _savePrediction();
+                },
+                keyboardType: TextInputType.number,
                 autofocus: false,
                 enabled: true,
-                obscureText: false,
                 decoration: InputDecoration(
                   isDense: true,
-                  labelStyle: FlutterFlowTheme.of(context).labelMedium.override(
-                        font: GoogleFonts.inter(
-                          fontWeight: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontWeight,
-                          fontStyle: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontStyle,
-                        ),
-                        letterSpacing: 0.0,
-                        fontWeight:
-                            FlutterFlowTheme.of(context).labelMedium.fontWeight,
-                        fontStyle:
-                            FlutterFlowTheme.of(context).labelMedium.fontStyle,
-                      ),
-                  hintText: 'TextField',
-                  hintStyle: FlutterFlowTheme.of(context).labelMedium.override(
-                        font: GoogleFonts.inter(
-                          fontWeight: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontWeight,
-                          fontStyle: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontStyle,
-                        ),
-                        letterSpacing: 0.0,
-                        fontWeight:
-                            FlutterFlowTheme.of(context).labelMedium.fontWeight,
-                        fontStyle:
-                            FlutterFlowTheme.of(context).labelMedium.fontStyle,
-                      ),
+                  hintText: '0',
                   enabledBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Color(0x00000000),
-                      width: 1.0,
-                    ),
+                    borderSide: const BorderSide(color: Color(0x00000000)),
                     borderRadius: BorderRadius.circular(8.0),
                   ),
                   focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Color(0x00000000),
-                      width: 1.0,
-                    ),
-                    borderRadius: BorderRadius.circular(8.0),
-                  ),
-                  errorBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: FlutterFlowTheme.of(context).error,
-                      width: 1.0,
-                    ),
-                    borderRadius: BorderRadius.circular(8.0),
-                  ),
-                  focusedErrorBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: FlutterFlowTheme.of(context).error,
-                      width: 1.0,
-                    ),
+                    borderSide: const BorderSide(color: Color(0x00000000)),
                     borderRadius: BorderRadius.circular(8.0),
                   ),
                   filled: true,
                   fillColor: FlutterFlowTheme.of(context).secondaryBackground,
                 ),
                 style: FlutterFlowTheme.of(context).bodyMedium.override(
-                      font: GoogleFonts.inter(
-                        fontWeight:
-                            FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                        fontStyle:
-                            FlutterFlowTheme.of(context).bodyMedium.fontStyle,
-                      ),
+                      font: GoogleFonts.inter(),
                       letterSpacing: 0.0,
-                      fontWeight:
-                          FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                      fontStyle:
-                          FlutterFlowTheme.of(context).bodyMedium.fontStyle,
                     ),
                 textAlign: TextAlign.center,
                 cursorColor: FlutterFlowTheme.of(context).primaryText,
-                enableInteractiveSelection: true,
-                validator: _model.homeGuessTextControllerValidator
-                    .asValidator(context),
+                validator:
+                    _model.homeGuessTextControllerValidator.asValidator(context),
               ),
             ),
           ),
+
+          // AWAY SCORE
           Expanded(
-            child: Container(
+            child: SizedBox(
               width: 200.0,
               child: TextFormField(
                 controller: _model.awayGuessTextController,
                 focusNode: _model.awayGuessFocusNode,
+                onChanged: (_) => _debouncedSave('away_${widget.matchId}'),
+                onEditingComplete: () async {
+                  await _savePrediction();
+                  FocusScope.of(context).unfocus();
+                },
+                onFieldSubmitted: (_) async {
+                  await _savePrediction();
+                },
+                keyboardType: TextInputType.number,
                 autofocus: false,
                 enabled: true,
-                obscureText: false,
                 decoration: InputDecoration(
                   isDense: true,
-                  labelStyle: FlutterFlowTheme.of(context).labelMedium.override(
-                        font: GoogleFonts.inter(
-                          fontWeight: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontWeight,
-                          fontStyle: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontStyle,
-                        ),
-                        letterSpacing: 0.0,
-                        fontWeight:
-                            FlutterFlowTheme.of(context).labelMedium.fontWeight,
-                        fontStyle:
-                            FlutterFlowTheme.of(context).labelMedium.fontStyle,
-                      ),
-                  hintText: 'TextField',
-                  hintStyle: FlutterFlowTheme.of(context).labelMedium.override(
-                        font: GoogleFonts.inter(
-                          fontWeight: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontWeight,
-                          fontStyle: FlutterFlowTheme.of(context)
-                              .labelMedium
-                              .fontStyle,
-                        ),
-                        letterSpacing: 0.0,
-                        fontWeight:
-                            FlutterFlowTheme.of(context).labelMedium.fontWeight,
-                        fontStyle:
-                            FlutterFlowTheme.of(context).labelMedium.fontStyle,
-                      ),
+                  hintText: '0',
                   enabledBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Color(0x00000000),
-                      width: 1.0,
-                    ),
+                    borderSide: const BorderSide(color: Color(0x00000000)),
                     borderRadius: BorderRadius.circular(8.0),
                   ),
                   focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Color(0x00000000),
-                      width: 1.0,
-                    ),
-                    borderRadius: BorderRadius.circular(8.0),
-                  ),
-                  errorBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: FlutterFlowTheme.of(context).error,
-                      width: 1.0,
-                    ),
-                    borderRadius: BorderRadius.circular(8.0),
-                  ),
-                  focusedErrorBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: FlutterFlowTheme.of(context).error,
-                      width: 1.0,
-                    ),
+                    borderSide: const BorderSide(color: Color(0x00000000)),
                     borderRadius: BorderRadius.circular(8.0),
                   ),
                   filled: true,
                   fillColor: FlutterFlowTheme.of(context).secondaryBackground,
                 ),
                 style: FlutterFlowTheme.of(context).bodyMedium.override(
-                      font: GoogleFonts.inter(
-                        fontWeight:
-                            FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                        fontStyle:
-                            FlutterFlowTheme.of(context).bodyMedium.fontStyle,
-                      ),
+                      font: GoogleFonts.inter(),
                       letterSpacing: 0.0,
-                      fontWeight:
-                          FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                      fontStyle:
-                          FlutterFlowTheme.of(context).bodyMedium.fontStyle,
                     ),
                 textAlign: TextAlign.center,
                 cursorColor: FlutterFlowTheme.of(context).primaryText,
-                enableInteractiveSelection: true,
-                validator: _model.awayGuessTextControllerValidator
-                    .asValidator(context),
+                validator:
+                    _model.awayGuessTextControllerValidator.asValidator(context),
               ),
             ),
           ),
+
           Padding(
-            padding: EdgeInsetsDirectional.fromSTEB(0.0, 0.0, 5.0, 0.0),
+            padding: const EdgeInsetsDirectional.fromSTEB(0.0, 0.0, 5.0, 0.0),
             child: Text(
-              valueOrDefault<String>(
-                widget.awayShort,
-                'away',
-              ),
+              valueOrDefault<String>(widget.awayShort, 'away'),
               style: FlutterFlowTheme.of(context).bodyMedium.override(
-                    font: GoogleFonts.inter(
-                      fontWeight:
-                          FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                      fontStyle:
-                          FlutterFlowTheme.of(context).bodyMedium.fontStyle,
-                    ),
+                    font: GoogleFonts.inter(),
                     letterSpacing: 0.0,
-                    fontWeight:
-                        FlutterFlowTheme.of(context).bodyMedium.fontWeight,
-                    fontStyle:
-                        FlutterFlowTheme.of(context).bodyMedium.fontStyle,
                   ),
             ),
           ),
           Padding(
-            padding: EdgeInsetsDirectional.fromSTEB(0.0, 0.0, 10.0, 0.0),
+            padding: const EdgeInsetsDirectional.fromSTEB(0.0, 0.0, 10.0, 0.0),
             child: Container(
               width: 40.0,
               height: 40.0,
               clipBehavior: Clip.antiAlias,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-              ),
+              decoration: const BoxDecoration(shape: BoxShape.circle),
               child: Image.network(
-                widget.awayLogoUrl!,
+                widget.awayLogoUrl ?? '',
                 fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
               ),
             ),
           ),
